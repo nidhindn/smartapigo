@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
-	SmartApi "github.com/angel-one/smartapigo"
-	"github.com/angel-one/smartapigo/websocket"
 	"time"
+
+	SmartApi "github.com/nidhindn/smartapigo"
+	"github.com/nidhindn/smartapigo/websocket"
 )
 
 var socketClient *websocket.SocketClient
@@ -56,7 +57,7 @@ func main() {
 		return
 	}
 
-	//Get User Profile
+	// Get User Profile
 	session.UserProfile, err = ABClient.GetUserProfile()
 
 	if err != nil {
