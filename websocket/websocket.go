@@ -1,18 +1,18 @@
 package websocket
 
 import (
-	"bytes"
-	"compress/zlib"
 	"crypto/tls"
-	"encoding/base64"
-	"encoding/json"
+	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/gorilla/websocket"
-	"io/ioutil"
+	"log"
 	"math"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type SocketClient struct {
@@ -24,14 +24,43 @@ type SocketClient struct {
 	reconnectMaxDelay   time.Duration
 	connectTimeout      time.Duration
 	reconnectAttempt    int
-	scrips              string
+	SubscribeTokenList  []SubscribeTokenObj
 	feedToken           string
 	clientCode          string
+	accessToken         string
+	apiKey              string
+}
+
+type SmartStreamLtpTick struct {
+	SubMode  uint64
+	ExchType uint64
+	Token    string
+	SeqNo    uint64
+	ExchTs   uint64
+	Ltp      float32
+}
+
+type SmartStreamTick struct {
+	SmartStreamLtpTick
+}
+
+type SmartStreamSubscribeRequestModel struct {
+	CorrelationID string `json:"correlationID,omitempty"`
+	Action        int    `json:"action"`
+	Params        struct {
+		Mode      int                 `json:"mode"`
+		TokenList []SubscribeTokenObj `json:"tokenList"`
+	} `json:"params"`
+}
+
+type SubscribeTokenObj struct {
+	ExchangeType int      `json:"exchangeType"`
+	Tokens       []string `json:"tokens"`
 }
 
 // callbacks represents callbacks available in ticker.
 type callbacks struct {
-	onMessage     func([]map[string]interface{})
+	onMessage     func(tick SmartStreamTick)
 	onNoReconnect func(int)
 	onReconnect   func(int, time.Duration)
 	onConnect     func()
@@ -51,24 +80,46 @@ const (
 	defaultConnectTimeout time.Duration = 7000 * time.Millisecond
 	// Interval in which the connection check is performed periodically.
 	connectionCheckInterval time.Duration = 10000 * time.Millisecond
+
+	pingIntervalSeconds = 25
+	pingStr             = ">>>ping>>>"
+	pongStr             = "<<<pong<<<"
+
+	actionSubscribe   = 0
+	actionUnSubscribe = 1
+
+	Nse_cm = 1
+	Nse_fo = 2
+	Bse_cm = 3
+	Bse_fo = 4
+	Mcx_fo = 5
+	Ncx_fo = 7
+	Cde_fo = 13
+
+	ModeLTP = 1
+	// only mode: LTP is currently supported
+	// ModeQuote     = 2
+	// ModeSnapQuote = 3
+	// Mode20Depth   = 4
 )
 
 var (
 	// Default ticker url.
-	tickerURL = url.URL{Scheme: "wss", Host: "wsfeeds.angelbroking.com", Path: "/NestHtml5Mobile/socket/stream"}
+	tickerURL = url.URL{Scheme: "wss", Host: "smartapisocket.angelone.in", Path: "smart-stream"}
 )
 
 // New creates a new ticker instance.
-func New(clientCode string, feedToken string, scrips string) *SocketClient {
+func New(clientCode, apiKey, feedToken, accessToken string) *SocketClient {
 	sc := &SocketClient{
 		clientCode:          clientCode,
 		feedToken:           feedToken,
+		accessToken:         accessToken,
+		apiKey:              apiKey,
 		url:                 tickerURL,
 		autoReconnect:       true,
 		reconnectMaxDelay:   defaultReconnectMaxDelay,
 		reconnectMaxRetries: defaultReconnectMaxAttempts,
 		connectTimeout:      defaultConnectTimeout,
-		scrips:              scrips,
 	}
 
 	return sc
@@ -125,7 +176,7 @@ func (s *SocketClient) OnClose(f func(code int, reason string)) {
 }
 
 // OnMessage callback.
-func (s *SocketClient) OnMessage(f func(message []map[string]interface{})) {
+func (s *SocketClient) OnMessage(f func(message SmartStreamTick)) {
 	s.callbacks.onMessage = f
 }
 
@@ -168,10 +219,20 @@ func (s *SocketClient) Serve() {
 		d.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
-		conn, _, err := d.Dial(s.url.String(), nil)
+		headers := http.Header{
+			"Authorization": []string{s.accessToken},
+			"x-api-key":     []string{s.apiKey},
+			"x-client-code": []string{s.clientCode},
+			"x-feed-token":  []string{s.feedToken},
+		}
+		conn, _, err := d.Dial(s.url.String(), headers)
 		if err != nil {
+			if errors.Is(err, websocket.ErrBadHandshake) {
+				log.Println(`wss handshake failed, please double check your credentials and account`)
+				return
+			}
 			s.triggerError(err)
-			// If auto reconnect is enabled then try reconneting else return error
+			// If auto reconnect is enabled then try reconnecting else return error
 			if s.autoReconnect {
 				s.reconnectAttempt++
 				continue
@@ -179,41 +240,40 @@ func (s *SocketClient) Serve() {
 			return
 		}
 
-		err = conn.WriteMessage(websocket.TextMessage, []byte(`{"task":"cn","channel":"","token":"`+s.feedToken+`","user": "`+s.clientCode+`","acctid":"`+s.clientCode+`"}`))
+		// ping the server
+		err = conn.WriteMessage(websocket.TextMessage, []byte(`ping`))
 		if err != nil {
 			s.triggerError(err)
 			return
 		}
+		log.Println(pingStr)
 
+		// server should respond pong
 		_, message, err := conn.ReadMessage()
-		if err != nil {
+		if err != nil || string(message) != "pong" {
 			s.triggerError(err)
 			return
 		}
-		sDec, _ := base64.StdEncoding.DecodeString(string(message))
-		val, err := readSegment(sDec)
-		var result []map[string]interface{}
-		err = json.Unmarshal(val, &result)
-		if err != nil {
-			s.triggerError(err)
-			return
-		}
-		if len(result) == 0 {
-			s.triggerError(fmt.Errorf("Invalid Message"))
-			return
-		}
+		pongHandler()
 
-		if _, ok := result[0]["ak"]; !ok {
-			s.triggerError(fmt.Errorf("Invalid Message"))
-			return
-		}
-
-		if val, ok := result[0]["ak"]; ok {
-			if val == "nk" {
-				s.triggerError(fmt.Errorf("Invalid feed token or client code"))
-				return
+		// schedule periodic pinger
+		go func() {
+			tk := time.NewTicker(time.Second * pingIntervalSeconds)
+			defer tk.Stop()
+			for {
+				select {
+				case <-tk.C:
+					// ping the server
+					err = conn.WriteMessage(websocket.TextMessage, []byte(`ping`))
+					if err != nil {
+						s.triggerError(err)
+						return
+					}
+					log.Println(pingStr)
+				}
 			}
-		}
+
+		}()
 
 		// Close the connection when its done.
 		defer s.Conn.Close()
@@ -288,7 +348,7 @@ func (s *SocketClient) triggerNoReconnect(attempt int) {
 	}
 }
 
-func (s *SocketClient) triggerMessage(message []map[string]interface{}) {
+func (s *SocketClient) triggerMessage(message SmartStreamTick) {
 	if s.callbacks.onMessage != nil {
 		s.callbacks.onMessage(message)
 	}
@@ -307,40 +367,35 @@ func (s *SocketClient) checkConnection(wg *sync.WaitGroup, Restart chan bool) {
 func (s *SocketClient) readMessage(wg *sync.WaitGroup, Restart chan bool) {
 	defer wg.Done()
 	for {
-		_, msg, err := s.Conn.ReadMessage()
+		msgType, msg, err := s.Conn.ReadMessage()
 		if err != nil {
 			s.triggerError(fmt.Errorf("Error reading data: %v", err))
 			Restart <- true
 			return
 		}
 
-		sDec, _ := base64.StdEncoding.DecodeString(string(msg))
-		val, err := readSegment(sDec)
-		if err != nil {
-			s.triggerError(err)
-			return
-		}
-
-		var finalMessage []map[string]interface{}
-		err = json.Unmarshal(val, &finalMessage)
-		if err != nil {
-			s.triggerError(err)
-			return
-		}
-
-		if len(finalMessage) == 0 {
+		if msgType == websocket.TextMessage && string(msg) == "pong" {
+			pongHandler()
 			continue
 		}
 
-		if val, ok := finalMessage[0]["ak"]; ok {
-			if val == "nk" {
-				s.triggerError(fmt.Errorf("Invalid feed token or client code"))
-			}
-			continue
-		}
+		// TODO: implement recovery from panic
+
+		// only LTP mode is currently supported
+		// assuming LTP tick, parse it
+		ssTick := SmartStreamTick{}
+
+		// ssTick.SubMode = binary.LittleEndian.Uint64(msg[0:1])
+		ssTick.SubMode = uint64(msg[0])
+		ssTick.ExchType = uint64(msg[1])
+		ssTick.Token = string(msg[2:27])
+		// sequence number not required for me, ignore it
+		// ssTick.SeqNo = binary.LittleEndian.Uint64(msg[27:35])
+		ssTick.ExchTs = binary.LittleEndian.Uint64(msg[35:43])
+		ssTick.Ltp = float32(binary.LittleEndian.Uint32(msg[43:51])) / 100
 
 		// Trigger message.
-		s.triggerMessage(finalMessage)
+		s.triggerMessage(ssTick)
 
 	}
 }
@@ -351,31 +406,30 @@ func (s *SocketClient) Close() error {
 }
 
 // Subscribe subscribes tick for the given list of tokens.
-func (s *SocketClient) Subscribe() error {
-	err := s.Conn.WriteMessage(websocket.TextMessage, []byte(`{"task":"mw","channel":"`+s.scrips+`","token":"`+s.feedToken+`","user": "`+s.clientCode+`","acctid":"`+s.clientCode+`"}`))
+func (s *SocketClient) Subscribe(tokenList []SubscribeTokenObj) error {
+
+	reqObj := SmartStreamSubscribeRequestModel{}
+	reqObj.Action = actionUnSubscribe
+	reqObj.Params.Mode = ModeLTP
+	reqObj.Params.TokenList = tokenList
+
+	err := s.Conn.WriteJSON(reqObj)
 	if err != nil {
 		s.triggerError(err)
 		return err
 	}
 
+	s.SubscribeTokenList = tokenList
 	return nil
 }
 
 func (s *SocketClient) Resubscribe() error {
-	err := s.Subscribe()
+	err := s.Subscribe(s.SubscribeTokenList)
 	return err
 }
 
-func readSegment(data []byte) ([]byte, error) {
-	b := bytes.NewReader(data)
-	z, err := zlib.NewReader(b)
-	if err != nil {
-		return nil, err
-	}
-	defer z.Close()
-	p, err := ioutil.ReadAll(z)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+// pongHandler is used to handle PongMessages for the Client
+func pongHandler() {
+	// TODO: update connectionCheck and reconnection handlers
+	log.Println(pongStr)
 }
